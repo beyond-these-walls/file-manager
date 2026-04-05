@@ -1,0 +1,31 @@
+{
+    "name": "beyond-these-walls/file-manager",
+    "description": "A full-featured Livewire file manager component with image editing and AI generation.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "beyond-these-walls"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0|^12.0",
+        "intervention/image": "^3.0",
+        "livewire/livewire": "^3.0|^4.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "BeyondTheseWalls\\FileManager\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "BeyondTheseWalls\\FileManager\\FileManagerServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
