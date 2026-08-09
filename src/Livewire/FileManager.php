@@ -5,12 +5,17 @@ namespace BeyondTheseWalls\FileManager\Livewire;
 use BeyondTheseWalls\FileManager\Services\CloudflareImageService;
 use BeyondTheseWalls\FileManager\Services\HuggingFaceImageService;
 use BeyondTheseWalls\FileManager\Services\PicsartImageService;
+use Illuminate\Contracts\Filesystem\Filesystem;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Intervention\Image\Drivers\Gd\Driver;
 use Intervention\Image\ImageManager;
+use League\Flysystem\DirectoryAttributes;
+use League\Flysystem\FileAttributes;
+use Livewire\Attributes\On;
 use Livewire\Component;
 use Livewire\WithFileUploads;
 
@@ -18,31 +23,31 @@ class FileManager extends Component
 {
     use WithFileUploads;
 
-    public $isOpen = false;
+    public bool $isOpen = false;
 
-    public $currentPath = '';
+    public string $currentPath = '';
 
-    public $rootPath = '';
+    public string $rootPath = '';
 
-    public $files = [];
+    public array $files = [];
 
-    public $folders = [];
+    public array $folders = [];
 
     public $uploadedFiles = [];
 
     public $selectedFile = null;
 
-    public $viewMode = 'grid';
+    public string $viewMode = 'grid';
 
-    public $searchTerm = '';
+    public string $searchTerm = '';
 
-    public $showCreateFolder = false;
+    public bool $showCreateFolder = false;
 
-    public $newFolderName = '';
+    public string $newFolderName = '';
 
-    public $mediaType = 'all';
+    public string $mediaType = 'all';
 
-    public $showDeleteModal = false;
+    public bool $showDeleteModal = false;
 
     public $fileToDelete = null;
 
@@ -52,6 +57,30 @@ class FileManager extends Component
     public array $selectedFiles = [];
 
     public bool $showBulkDeleteModal = false;
+
+    // Rename file
+    public ?array $renamingFile = null;
+
+    public string $renameValue = '';
+
+    // Rename folder
+    public ?array $renamingFolder = null;
+
+    public string $renameFolderValue = '';
+
+    // Delete folder
+    public ?array $folderToDelete = null;
+
+    public bool $showFolderDeleteModal = false;
+
+    // Move
+    public bool $showMoveModal = false;
+
+    public array $filesToMove = [];
+
+    public ?string $moveTargetFolder = null;
+
+    public array $availableFolders = [];
 
     // Pagination
     public int $perPage = 48;
@@ -75,7 +104,6 @@ class FileManager extends Component
 
     public ?array $aiQuota = null;
 
-    // Stored for regeneration from preview
     public string $lastAiPrompt = '';
 
     public string $lastAiProvider = 'cloudflare';
@@ -84,7 +112,9 @@ class FileManager extends Component
 
     public bool $isAiGeneratedPreview = false;
 
-    // Image editor state (rotate/flip/brightness/contrast/quality live in Alpine only)
+    public array $notification = [];
+
+    // Image editor state
     public ?array $previewFile = null;
 
     public ?int $editResizeWidth = null;
@@ -97,188 +127,294 @@ class FileManager extends Component
 
     public array $originalDimensions = [];
 
-    // SECURITY: Define allowed file types and their MIME types
-    protected $allowedFileTypes = [
-        'image' => [
-            'extensions' => ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
-            'mimes' => ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'],
-            'max_size' => 10240, // 10MB in KB
-        ],
-        'media' => [
-            'extensions' => ['mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm', 'mp3', 'wav', 'ogg', 'flac', 'aac'],
-            'mimes' => ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-ms-wmv', 'video/x-flv', 'video/x-matroska', 'video/webm', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/aac'],
-            'max_size' => 102400, // 100MB in KB
-        ],
-        'file' => [
-            'extensions' => ['pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'xls', 'xlsx', 'csv', 'ppt', 'pptx'],
-            'mimes' => ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain', 'application/rtf', 'application/vnd.oasis.opendocument.text', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv', 'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
-            'max_size' => 51200, // 50MB in KB
-        ],
-    ];
-
-    // SECURITY: Dangerous file extensions that should NEVER be allowed
-    protected $dangerousExtensions = [
-        'php', 'php3', 'php4', 'php5', 'phtml', 'asp', 'aspx', 'jsp', 'jspx',
-        'exe', 'bat', 'cmd', 'com', 'scr', 'vbs', 'vbe', 'js', 'jar',
-        'sh', 'bash', 'pl', 'py', 'rb', 'cgi', 'htaccess', 'htpasswd',
-    ];
-
     // Default folder mapping for different media types
-    protected $mediaTypeFolders = [
+    protected array $mediaTypeFolders = [
         'image' => 'images',
         'media' => 'videos',
-        'file' => 'files',
-        'all' => '',
+        'file'  => 'files',
+        'all'   => '',
     ];
 
-    protected $listeners = [
-        'openFileManager' => 'open',
-        'closeFileManager' => 'close',
-    ];
+    // ── Config helpers ────────────────────────────────────────────────────────
 
-    public function mount()
+    protected function disk(): Filesystem
     {
-        $this->loadFiles();
+        return Storage::disk(config('file-manager.disk', 'public'));
     }
 
-    public function open($mediaType = 'all', $path = null)
+    protected function basePath(string $suffix = ''): string
     {
-        $this->isOpen = true;
+        $base = rtrim(config('file-manager.base_path', 'uploads'), '/');
+
+        return $suffix === '' ? $base : $base.'/'.ltrim($suffix, '/');
+    }
+
+    protected function thumbnailStoragePath(string $filename): string
+    {
+        return $this->basePath('thumbnails/'.$filename);
+    }
+
+    private function allowedFileTypes(): array
+    {
+        return config('file-manager.allowed_file_types', [
+            'image' => [
+                'extensions' => ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+                'mimes'      => ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'],
+                'max_size'   => 10240,
+            ],
+            'media' => [
+                'extensions' => ['mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm', 'mp3', 'wav', 'ogg', 'flac', 'aac'],
+                'mimes'      => [
+                    'video/mp4', 'video/avi', 'video/quicktime', 'video/x-ms-wmv',
+                    'video/x-flv', 'video/x-matroska', 'video/webm',
+                    'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/aac',
+                ],
+                'max_size'   => 102400,
+            ],
+            'file' => [
+                'extensions' => ['pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'xls', 'xlsx', 'csv', 'ppt', 'pptx'],
+                'mimes'      => [
+                    'application/pdf', 'application/msword',
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    'text/plain', 'application/rtf',
+                    'application/vnd.oasis.opendocument.text',
+                    'application/vnd.ms-excel',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'text/csv', 'application/vnd.ms-powerpoint',
+                    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                ],
+                'max_size'   => 51200,
+            ],
+        ]);
+    }
+
+    private function dangerousExtensions(): array
+    {
+        return config('file-manager.dangerous_extensions', [
+            'php', 'php3', 'php4', 'php5', 'phtml', 'asp', 'aspx', 'jsp', 'jspx',
+            'exe', 'bat', 'cmd', 'com', 'scr', 'vbs', 'vbe', 'js', 'jar',
+            'sh', 'bash', 'pl', 'py', 'rb', 'cgi', 'htaccess', 'htpasswd',
+        ]);
+    }
+
+    // ── Authorization ─────────────────────────────────────────────────────────
+
+    protected function checkAccess(): void
+    {
+        abort_unless(auth()->check(), 403);
+
+        $gate = config('file-manager.auth_gate');
+        if ($gate && ! Gate::check($gate)) {
+            abort(403);
+        }
+    }
+
+    private function notify(string $message, string $type = 'success'): void
+    {
+        $this->notification = ['message' => $message, 'type' => $type];
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    public function mount(): void
+    {
+        // Defer filesystem scan until the modal is actually opened
+    }
+
+    #[On('openFileManager')]
+    public function open(string $mediaType = 'all', ?string $path = null): void
+    {
+        $this->isOpen    = true;
         $this->mediaType = $mediaType;
         $this->currentPath = $path ?? ($this->mediaTypeFolders[$mediaType] ?? '');
-        $this->rootPath = $this->currentPath;
+        $this->rootPath  = $this->currentPath;
         $this->loadFiles();
     }
 
-    public function close()
+    #[On('closeFileManager')]
+    public function close(): void
     {
-        $this->isOpen = false;
-        $this->selectedFile = null;
-        $this->mediaType = 'all';
-        $this->currentPath = '';
-        $this->rootPath = '';
-        $this->showDeleteModal = false;
-        $this->fileToDelete = null;
-        $this->previewFile = null;
+        $this->isOpen             = false;
+        $this->selectedFile       = null;
+        $this->mediaType          = 'all';
+        $this->currentPath        = '';
+        $this->rootPath           = '';
+        $this->showDeleteModal    = false;
+        $this->fileToDelete       = null;
+        $this->previewFile        = null;
         $this->isAiGeneratedPreview = false;
-        $this->lastAiPrompt = '';
-        $this->selectedFiles = [];
+        $this->lastAiPrompt       = '';
+        $this->selectedFiles      = [];
         $this->showBulkDeleteModal = false;
-        $this->currentPage = 1;
+        $this->currentPage        = 1;
+        $this->renamingFile       = null;
+        $this->renameValue        = '';
+        $this->renamingFolder     = null;
+        $this->renameFolderValue  = '';
+        $this->folderToDelete     = null;
+        $this->showFolderDeleteModal = false;
+        $this->showMoveModal      = false;
+        $this->filesToMove        = [];
+        $this->moveTargetFolder   = null;
+        $this->files              = [];
+        $this->folders            = [];
+        $this->showAiGenerator    = false;
+        $this->aiGenerating       = false;
+        $this->aiError            = '';
+        $this->aiPrompt           = '';
+        $this->notification       = [];
         $this->resetEdits();
     }
 
-    public function loadFiles()
+    // ── File listing ──────────────────────────────────────────────────────────
+
+    protected function loadFiles(): void
     {
-        $path = 'uploads/'.trim($this->currentPath, '/');
+        $path        = $this->basePath(trim($this->currentPath, '/'));
+        $searchLower = $this->searchTerm ? strtolower($this->searchTerm) : null;
+        $isSearching = $searchLower !== null;
 
-        $allFiles = Storage::disk('public')->files($path);
-        $allFolders = Storage::disk('public')->directories($path);
+        $rawFiles   = [];
+        $rawFolders = [];
 
-        $filteredFiles = collect($allFiles)->map(function ($file) {
-            $filename = basename($file);
+        // Deep scan when searching so results cross subdirectory boundaries.
+        foreach ($this->disk()->listContents($path, $isSearching) as $item) {
+            if ($item instanceof FileAttributes) {
+                $rawFiles[] = $item;
+            } elseif ($item instanceof DirectoryAttributes && ! $isSearching) {
+                $rawFolders[] = $item;
+            }
+        }
 
-            if ($this->searchTerm && ! Str::contains(strtolower($filename), strtolower($this->searchTerm))) {
+        usort($rawFiles, fn (FileAttributes $a, FileAttributes $b)
+            => ($b->lastModified() ?? 0) <=> ($a->lastModified() ?? 0));
+
+        $filteredFiles = collect($rawFiles)->map(function (FileAttributes $item) use ($searchLower, $path, $isSearching) {
+            $filename = basename($item->path());
+
+            if ($searchLower && ! str_contains(strtolower($filename), $searchLower)) {
                 return null;
             }
 
-            $fileType = $this->getFileType($file);
+            $fileType = $this->getFileType($filename);
 
             if ($this->mediaType !== 'all' && ! $this->isFileTypeMatch($fileType, $this->mediaType)) {
                 return null;
             }
 
-            $modified = Storage::disk('public')->lastModified($file);
+            $modified  = $item->lastModified() ?? 0;
+            $size      = $item->fileSize() ?? 0;
+            $filePath  = $item->path();
 
-            return [
-                'name' => $filename,
-                'path' => $file,
-                'url' => Storage::disk('public')->url($file).'?t='.$modified,
-                'size' => Storage::disk('public')->size($file),
-                'type' => $fileType,
-                'modified' => $modified,
-                'thumbnail' => $this->getThumbnailUrl($file, $modified),
-            ];
-        })->filter()->values();
-
-        // Pagination
-        $this->totalFiles = $filteredFiles->count();
-        $maxPage = max(1, (int) ceil($this->totalFiles / $this->perPage));
-        if ($this->currentPage > $maxPage) {
-            $this->currentPage = $maxPage;
-        }
-        $this->files = $filteredFiles->slice(($this->currentPage - 1) * $this->perPage, $this->perPage)->values()->toArray();
-
-        $this->folders = collect($allFolders)->map(function ($folder) {
-            $folderName = basename($folder);
-
-            if ($this->searchTerm && ! Str::contains(strtolower($folderName), strtolower($this->searchTerm))) {
-                return null;
+            // Show the relative subdirectory as context during a recursive search.
+            $subfolder = '';
+            if ($isSearching) {
+                $dir       = dirname($filePath);
+                $subfolder = $dir !== $path ? ltrim(substr($dir, strlen($path)), '/') : '';
             }
 
             return [
-                'name' => $folderName,
-                'path' => $folder,
+                'name'      => $filename,
+                'path'      => $filePath,
+                'url'       => $this->disk()->url($filePath).'?t='.$modified,
+                'size'      => $size,
+                'type'      => $fileType,
+                'modified'  => $modified,
+                'thumbnail' => $this->getThumbnailUrl($filePath, $modified ?: null),
+                'subfolder' => $subfolder,
             ];
-        })->filter()->values()->toArray();
+        })->filter()->values();
+
+        $this->totalFiles = $filteredFiles->count();
+        $maxPage          = max(1, (int) ceil($this->totalFiles / $this->perPage));
+        if ($this->currentPage > $maxPage) {
+            $this->currentPage = $maxPage;
+        }
+        $this->files = $filteredFiles
+            ->slice(($this->currentPage - 1) * $this->perPage, $this->perPage)
+            ->values()
+            ->toArray();
+
+        // Folders are not meaningful during a recursive search.
+        if ($isSearching) {
+            $this->folders = [];
+            return;
+        }
+
+        $this->folders = collect($rawFolders)
+            ->sortBy(fn (DirectoryAttributes $d) => basename($d->path()))
+            ->map(fn (DirectoryAttributes $item) => [
+                'name'      => basename($item->path()),
+                'path'      => $item->path(),
+                'fileCount' => count($this->disk()->files($item->path())),
+            ])
+            ->values()
+            ->toArray();
     }
 
-    public function navigateToFolder($folderPath)
+    public function navigateToFolder(string $folderPath): void
     {
-        $stripped = str_replace('uploads/', '', $folderPath);
-        $this->currentPath = $this->sanitizePath($stripped);
-        $this->currentPage = 1;
+        $base    = $this->basePath().'/';
+        $stripped = str_starts_with($folderPath, $base)
+            ? substr($folderPath, strlen($base))
+            : $folderPath;
+
+        $this->currentPath  = $this->sanitizePath($stripped);
+        $this->currentPage  = 1;
         $this->selectedFiles = [];
         $this->loadFiles();
     }
 
-    public function goBack()
+    public function goBack(): void
     {
         if ($this->currentPath && $this->currentPath !== $this->rootPath) {
             $pathParts = explode('/', trim($this->currentPath, '/'));
             array_pop($pathParts);
             $parent = $this->sanitizePath(implode('/', $pathParts));
-            // Never navigate above the root path for this media type
-            $root = $this->sanitizePath($this->rootPath);
+            $root   = $this->sanitizePath($this->rootPath);
+
             if ($root && ! str_starts_with($parent.'/', $root.'/') && $parent !== $root) {
                 $this->currentPath = $root;
             } else {
                 $this->currentPath = $parent;
             }
-            $this->currentPage = 1;
+
+            $this->currentPage   = 1;
             $this->selectedFiles = [];
             $this->loadFiles();
         }
     }
 
-    public function goToMediaFolder($mediaType)
+    public function goToMediaFolder(string $mediaType): void
     {
         if (isset($this->mediaTypeFolders[$mediaType])) {
-            $this->mediaType = $mediaType;
-            $this->currentPath = $this->mediaTypeFolders[$mediaType]; // '' for 'all'
-            $this->currentPage = 1;
+            $this->mediaType    = $mediaType;
+            $this->currentPath  = $this->mediaTypeFolders[$mediaType];
+            $this->currentPage  = 1;
             $this->selectedFiles = [];
             $this->loadFiles();
         }
     }
 
-    public function selectFile($file)
+    public function selectFile(array $file): void
     {
         $this->selectedFile = $file;
         $this->dispatch('fileSelected', $file);
         $this->close();
     }
 
-    // SECURITY: Enhanced file upload with comprehensive validation
-    public function updatedUploadedFiles()
-    {
-        abort_unless(auth()->check(), 403);
+    // ── Upload ────────────────────────────────────────────────────────────────
 
-        // Rate limiting: max 20 uploads per minute per user
+    public function updatedUploadedFiles(): void
+    {
+        $this->checkAccess();
+
         $rateLimitKey = 'file-upload:'.auth()->id();
-        if (RateLimiter::tooManyAttempts($rateLimitKey, 20)) {
+        $limit        = config('file-manager.rate_limits.upload', 20);
+
+        if (RateLimiter::tooManyAttempts($rateLimitKey, $limit)) {
             $seconds = RateLimiter::availableIn($rateLimitKey);
-            session()->flash('error', "Too many uploads. Please wait {$seconds}s before uploading more files.");
+            $this->notify("Too many uploads. Please wait {$seconds}s before uploading more files.", 'error');
             $this->uploadedFiles = [];
 
             return;
@@ -290,19 +426,13 @@ class FileManager extends Component
             RateLimiter::hit($rateLimitKey, 60);
 
             try {
-                // SECURITY CHECK 1: Validate file using Laravel validation
                 $this->validateFile($file);
-
-                // SECURITY CHECK 2: Additional security checks
                 $this->performSecurityChecks($file);
 
-                // Generate safe filename — spaces → hyphens, then strip unsafe chars,
-                // append Str::random(16) to prevent enumeration and collisions
-                $originalName = $file->getClientOriginalName();
-                $extension = strtolower($file->getClientOriginalExtension());
+                $originalName        = $file->getClientOriginalName();
+                $extension           = strtolower($file->getClientOriginalExtension());
                 $nameWithoutExtension = pathinfo($originalName, PATHINFO_FILENAME);
 
-                // Sanitize filename: replace spaces/whitespace with hyphens, then strip unsafe chars
                 $nameWithoutExtension = preg_replace('/\s+/', '-', $nameWithoutExtension);
                 $nameWithoutExtension = preg_replace('/[^a-zA-Z0-9\-_]/', '', $nameWithoutExtension);
                 $nameWithoutExtension = trim($nameWithoutExtension, '-');
@@ -311,32 +441,32 @@ class FileManager extends Component
                 }
 
                 $filename = $nameWithoutExtension.'_'.now()->format('YmdHis').'_'.Str::random(6).'.'.$extension;
+                $diskName = config('file-manager.disk', 'public');
+                $subPath  = $this->basePath(trim($this->currentPath, '/'));
 
-                // Store file in safe location
-                $storedPath = $file->storeAs('uploads/'.trim($this->currentPath, '/'), $filename, 'public');
+                $storedPath = $file->storeAs($subPath, $filename, $diskName);
 
-                // Create thumbnail for images
                 if ($this->isImageFile($file)) {
-                    $this->createThumbnail('uploads/'.trim($this->currentPath, '/').'/'.$filename);
+                    $this->createThumbnail($storedPath);
                 }
 
                 $uploadedCount++;
 
                 logger()->info('File uploaded successfully', [
                     'original_name' => $originalName,
-                    'stored_name' => $filename,
-                    'size' => $file->getSize(),
-                    'mime' => $file->getMimeType(),
+                    'stored_name'   => $filename,
+                    'size'          => $file->getSize(),
+                    'mime'          => $file->getMimeType(),
                 ]);
 
             } catch (ValidationException $e) {
-                session()->flash('error', 'Upload failed: '.$e->getMessage());
+                $this->notify('Upload failed: '.$e->getMessage(), 'error');
 
                 continue;
             } catch (\Exception $e) {
-                session()->flash('error', 'Upload failed: '.$e->getMessage());
+                $this->notify('Upload failed: '.$e->getMessage(), 'error');
                 logger()->error('File upload failed', [
-                    'file' => $file->getClientOriginalName(),
+                    'file'  => $file->getClientOriginalName(),
                     'error' => $e->getMessage(),
                 ]);
 
@@ -348,91 +478,84 @@ class FileManager extends Component
         $this->loadFiles();
 
         if ($uploadedCount > 0) {
-            session()->flash('message', $uploadedCount === 1
+            $this->notify($uploadedCount === 1
                 ? 'File uploaded successfully!'
                 : "{$uploadedCount} files uploaded successfully!");
         }
     }
 
-    // SECURITY: Comprehensive file validation
-    protected function validateFile($file)
+    protected function validateFile($file): void
     {
-        $extension = strtolower($file->getClientOriginalExtension());
-        $mimeType = $file->getMimeType();
-        $size = $file->getSize() / 1024; // Convert to KB
+        $extension    = strtolower($file->getClientOriginalExtension());
+        $mimeType     = $file->getMimeType();
+        $sizeKb       = $file->getSize() / 1024;
+        $allowedTypes = $this->allowedFileTypes();
 
-        // Check 1: Block dangerous extensions
-        if (in_array($extension, $this->dangerousExtensions)) {
+        if (in_array($extension, $this->dangerousExtensions())) {
             throw new \Exception("File type '{$extension}' is not allowed for security reasons.");
         }
 
-        // Check 2: Validate against media type restrictions
         if ($this->mediaType !== 'all') {
-            $allowedTypes = $this->allowedFileTypes[$this->mediaType] ?? null;
+            $typeConfig = $allowedTypes[$this->mediaType] ?? null;
 
-            if (! $allowedTypes) {
+            if (! $typeConfig) {
                 throw new \Exception('Invalid media type.');
             }
 
-            // Extension check
-            if (! in_array($extension, $allowedTypes['extensions'])) {
+            if (! in_array($extension, $typeConfig['extensions'])) {
                 throw new \Exception("File extension '{$extension}' is not allowed for {$this->mediaType} files.");
             }
 
-            // MIME type check
-            if (! in_array($mimeType, $allowedTypes['mimes'])) {
+            if (! in_array($mimeType, $typeConfig['mimes'])) {
                 throw new \Exception("File type '{$mimeType}' is not allowed for {$this->mediaType} files.");
             }
 
-            // Size check
-            if ($size > $allowedTypes['max_size']) {
-                $maxSizeMB = round($allowedTypes['max_size'] / 1024, 1);
-                throw new \Exception("File size exceeds maximum allowed size of {$maxSizeMB}MB for {$this->mediaType} files.");
-            }
-        } else {
-            // For 'all' mode, find the type implied by the extension and verify the
-            // MIME type matches that same category — prevents extension/content mismatches
-            $matchedType = null;
-            foreach ($this->allowedFileTypes as $type => $typeConfig) {
-                if (in_array($extension, $typeConfig['extensions'])) {
-                    $matchedType = $type;
-                    break;
-                }
+            if ($sizeKb > $typeConfig['max_size']) {
+                $maxMb = round($typeConfig['max_size'] / 1024, 1);
+                throw new \Exception("File size exceeds maximum allowed size of {$maxMb}MB for {$this->mediaType} files.");
             }
 
-            if ($matchedType === null) {
-                throw new \Exception("File extension '{$extension}' is not in the allowed list.");
-            }
+            return;
+        }
 
-            if (! in_array($mimeType, $this->allowedFileTypes[$matchedType]['mimes'])) {
-                throw new \Exception("File MIME type does not match the file extension '{$extension}'.");
+        // 'all' mode: find the category by extension and cross-check MIME
+        $matchedType = null;
+        foreach ($allowedTypes as $type => $typeConfig) {
+            if (in_array($extension, $typeConfig['extensions'])) {
+                $matchedType = $type;
+                break;
             }
+        }
 
-            $maxSize = $this->allowedFileTypes[$matchedType]['max_size'];
-            if ($size > $maxSize) {
-                $maxSizeMB = round($maxSize / 1024, 1);
-                throw new \Exception("File size exceeds maximum allowed size of {$maxSizeMB}MB.");
-            }
+        if ($matchedType === null) {
+            throw new \Exception("File extension '{$extension}' is not in the allowed list.");
+        }
+
+        if (! in_array($mimeType, $allowedTypes[$matchedType]['mimes'])) {
+            throw new \Exception("File MIME type does not match the file extension '{$extension}'.");
+        }
+
+        $maxSize = $allowedTypes[$matchedType]['max_size'];
+        if ($sizeKb > $maxSize) {
+            $maxMb = round($maxSize / 1024, 1);
+            throw new \Exception("File size exceeds maximum allowed size of {$maxMb}MB.");
         }
     }
 
-    // SECURITY: Additional security checks
-    protected function performSecurityChecks($file)
+    protected function performSecurityChecks($file): void
     {
-        $extension = strtolower($file->getClientOriginalExtension());
-        $filename = $file->getClientOriginalName();
+        $filename  = $file->getClientOriginalName();
+        $dangerous = $this->dangerousExtensions();
 
-        // Check for double extensions (like .php.jpg)
-        if (preg_match('/\.('.implode('|', $this->dangerousExtensions).')\./i', $filename)) {
+        if (preg_match('/\.('.implode('|', $dangerous).')\./i', $filename)) {
             throw new \Exception('Files with multiple extensions are not allowed.');
         }
 
-        // Check for suspicious filenames
         $suspiciousPatterns = [
             '/\.(php|asp|jsp|exe|bat|cmd|sh)$/i',
-            '/^\.ht/i', // .htaccess, .htpasswd
-            '/\.\./i',  // Directory traversal
-            '/[<>:"|?*]/i', // Invalid filename characters
+            '/^\.ht/i',
+            '/\.\./i',
+            '/[<>:"|?*]/i',
         ];
 
         foreach ($suspiciousPatterns as $pattern) {
@@ -441,36 +564,29 @@ class FileManager extends Component
             }
         }
 
-        // For images, perform additional validation
         if ($this->isImageFile($file)) {
             $this->validateImageFile($file);
         }
     }
 
-    // SECURITY: Image-specific validation
-    protected function validateImageFile($file)
+    protected function validateImageFile($file): void
     {
-        try {
-            // Try to read the image to verify it's actually an image
-            $imageInfo = getimagesize($file->getPathname());
+        $imageInfo = getimagesize($file->getPathname());
 
-            if ($imageInfo === false) {
-                throw new \Exception('File is not a valid image.');
-            }
+        if ($imageInfo === false) {
+            throw new \Exception('File is not a valid image.');
+        }
 
-            // Check image dimensions (prevent extremely large images)
-            if ($imageInfo[0] > 10000 || $imageInfo[1] > 10000) {
-                throw new \Exception('Image dimensions are too large (max 10000x10000).');
-            }
-
-        } catch (\Exception $e) {
-            throw new \Exception('Image validation failed: '.$e->getMessage());
+        if ($imageInfo[0] > 10000 || $imageInfo[1] > 10000) {
+            throw new \Exception('Image dimensions are too large (max 10000×10000).');
         }
     }
 
+    // ── Delete (single file) ──────────────────────────────────────────────────
+
     public function deleteFile(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if ($this->deletingPreviewFile) {
             $this->deletePreviewFile();
@@ -485,21 +601,26 @@ class FileManager extends Component
         $safePath = $this->resolveSecurePath($this->fileToDelete['path']);
         if (! $safePath) {
             $this->showDeleteModal = false;
-            $this->fileToDelete = null;
+            $this->fileToDelete   = null;
 
             return;
         }
 
-        Storage::disk('public')->delete($safePath);
+        $this->disk()->delete($safePath);
+        $thumbPath = $this->thumbnailStoragePath(basename($safePath));
+        if ($this->disk()->exists($thumbPath)) {
+            $this->disk()->delete($thumbPath);
+        }
+
         $this->loadFiles();
         $this->showDeleteModal = false;
-        $this->fileToDelete = null;
-        session()->flash('message', 'File deleted successfully!');
+        $this->fileToDelete   = null;
+        $this->notify('File deleted successfully!');
     }
 
-    public function confirmDelete($file)
+    public function confirmDelete(array $file): void
     {
-        $this->fileToDelete = $file;
+        $this->fileToDelete    = $file;
         $this->showDeleteModal = true;
     }
 
@@ -509,46 +630,50 @@ class FileManager extends Component
             return;
         }
         $this->deletingPreviewFile = true;
-        $this->showDeleteModal = true;
+        $this->showDeleteModal     = true;
     }
 
-    public function cancelDelete()
+    public function cancelDelete(): void
     {
-        $this->showDeleteModal = false;
-        $this->fileToDelete = null;
+        $this->showDeleteModal     = false;
+        $this->fileToDelete        = null;
         $this->deletingPreviewFile = false;
     }
 
-    public function createFolder()
+    // ── Create folder ─────────────────────────────────────────────────────────
+
+    public function createFolder(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         $this->validate([
             'newFolderName' => 'required|string|max:255|regex:/^[a-zA-Z0-9\-_\s]+$/',
         ]);
 
         $safeCurrent = $this->sanitizePath($this->currentPath);
-        $folderPath = 'uploads/'.trim($safeCurrent, '/').'/'.$this->newFolderName;
+        $folderPath  = $this->basePath($safeCurrent.'/'.$this->newFolderName);
 
-        if (! Storage::disk('public')->exists($folderPath)) {
-            Storage::disk('public')->makeDirectory($folderPath);
+        if (! $this->disk()->exists($folderPath)) {
+            $this->disk()->makeDirectory($folderPath);
             $this->loadFiles();
-            session()->flash('message', 'Folder created successfully!');
+            $this->notify('Folder created successfully!');
         } else {
-            session()->flash('error', 'Folder already exists!');
+            $this->notify('Folder already exists!', 'error');
         }
 
         $this->showCreateFolder = false;
-        $this->newFolderName = '';
+        $this->newFolderName    = '';
     }
 
-    public function cancelCreateFolder()
+    public function cancelCreateFolder(): void
     {
         $this->showCreateFolder = false;
-        $this->newFolderName = '';
+        $this->newFolderName    = '';
     }
 
-    public function updatedSearchTerm()
+    // ── Search & pagination ───────────────────────────────────────────────────
+
+    public function updatedSearchTerm(): void
     {
         $this->currentPage = 1;
         $this->loadFiles();
@@ -565,7 +690,7 @@ class FileManager extends Component
         return max(1, (int) ceil($this->totalFiles / $this->perPage));
     }
 
-    // ── Multi-select ─────────────────────────────────────────────────────────
+    // ── Multi-select ──────────────────────────────────────────────────────────
 
     public function toggleSelectFile(string $path): void
     {
@@ -604,138 +729,466 @@ class FileManager extends Component
 
     public function bulkDelete(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         $deleted = 0;
         foreach ($this->selectedFiles as $path) {
             $safePath = $this->resolveSecurePath($path);
-            if ($safePath && Storage::disk('public')->exists($safePath)) {
-                Storage::disk('public')->delete($safePath);
+            if ($safePath && $this->disk()->exists($safePath)) {
+                $this->disk()->delete($safePath);
+                $thumbPath = $this->thumbnailStoragePath(basename($safePath));
+                if ($this->disk()->exists($thumbPath)) {
+                    $this->disk()->delete($thumbPath);
+                }
                 $deleted++;
             }
         }
 
-        $this->selectedFiles = [];
+        $this->selectedFiles      = [];
         $this->showBulkDeleteModal = false;
         $this->loadFiles();
 
         if ($deleted > 0) {
-            session()->flash('message', "{$deleted} file(s) deleted successfully!");
+            $this->notify("{$deleted} file(s) deleted successfully!");
         }
     }
 
-    private function isFileTypeMatch($fileType, $mediaType)
+    // ── Rename file ───────────────────────────────────────────────────────────
+
+    public function startRename(array $file): void
     {
-        switch ($mediaType) {
-            case 'image':
-                return $fileType === 'image';
-            case 'media':
-                return in_array($fileType, ['video', 'audio']);
-            case 'file':
-                return in_array($fileType, ['pdf', 'word', 'excel', 'powerpoint', 'text', 'document']);
-            default:
-                return true;
+        $this->renamingFile = $file;
+        $this->renameValue  = pathinfo($file['name'], PATHINFO_FILENAME);
+    }
+
+    public function cancelRename(): void
+    {
+        $this->renamingFile = null;
+        $this->renameValue  = '';
+    }
+
+    public function applyRename(): void
+    {
+        $this->checkAccess();
+
+        if (! $this->renamingFile) {
+            return;
+        }
+
+        $this->validate([
+            'renameValue' => 'required|string|max:200|regex:/^[a-zA-Z0-9\-_\s]+$/',
+        ]);
+
+        $oldPath = $this->resolveSecurePath($this->renamingFile['path']);
+        if (! $oldPath) {
+            return;
+        }
+
+        $extension  = strtolower(pathinfo($oldPath, PATHINFO_EXTENSION));
+        $newBasename = trim($this->renameValue);
+        $newBasename = preg_replace('/\s+/', '-', $newBasename);
+        $newBasename = preg_replace('/[^a-zA-Z0-9\-_]/', '', $newBasename);
+
+        if (empty($newBasename)) {
+            $this->notify('Invalid filename.', 'error');
+
+            return;
+        }
+
+        $newName = $newBasename.($extension ? '.'.$extension : '');
+        $newPath = dirname($oldPath).'/'.$newName;
+
+        if ($oldPath === $newPath) {
+            $this->cancelRename();
+
+            return;
+        }
+
+        if ($this->disk()->exists($newPath)) {
+            $this->notify("A file named '{$newName}' already exists.", 'error');
+
+            return;
+        }
+
+        $this->disk()->move($oldPath, $newPath);
+
+        $oldThumb = $this->thumbnailStoragePath(basename($oldPath));
+        $newThumb = $this->thumbnailStoragePath($newName);
+        if ($this->disk()->exists($oldThumb)) {
+            $this->disk()->move($oldThumb, $newThumb);
+        }
+
+        $this->cancelRename();
+        $this->loadFiles();
+        $this->notify("File renamed to '{$newName}'.");
+    }
+
+    // ── Rename folder ─────────────────────────────────────────────────────────
+
+    public function startRenameFolder(array $folder): void
+    {
+        $this->renamingFolder     = $folder;
+        $this->renameFolderValue  = $folder['name'];
+    }
+
+    public function cancelRenameFolder(): void
+    {
+        $this->renamingFolder    = null;
+        $this->renameFolderValue = '';
+    }
+
+    public function applyFolderRename(): void
+    {
+        $this->checkAccess();
+
+        if (! $this->renamingFolder) {
+            return;
+        }
+
+        $this->validate([
+            'renameFolderValue' => 'required|string|max:200|regex:/^[a-zA-Z0-9\-_\s]+$/',
+        ]);
+
+        $oldPath   = $this->sanitizePath($this->renamingFolder['path']);
+        $basePrefix = $this->basePath().'/';
+
+        if (! str_starts_with($oldPath, $basePrefix)) {
+            $this->notify('Invalid folder path.', 'error');
+
+            return;
+        }
+
+        $newName = preg_replace('/\s+/', '-', trim($this->renameFolderValue));
+        $newName = preg_replace('/[^a-zA-Z0-9\-_]/', '', $newName);
+
+        if (empty($newName)) {
+            $this->notify('Invalid folder name.', 'error');
+
+            return;
+        }
+
+        $parent  = dirname($oldPath);
+        $newPath = $parent.'/'.$newName;
+
+        if ($oldPath === $newPath) {
+            $this->cancelRenameFolder();
+
+            return;
+        }
+
+        if ($this->disk()->exists($newPath)) {
+            $this->notify("A folder named '{$newName}' already exists.", 'error');
+
+            return;
+        }
+
+        $oldAbsPath = $this->disk()->path($oldPath);
+        $newAbsPath = $this->disk()->path($newPath);
+
+        if (! rename($oldAbsPath, $newAbsPath)) {
+            $this->notify('Failed to rename folder.', 'error');
+
+            return;
+        }
+
+        // Update currentPath if it was inside the renamed folder
+        $base    = $this->basePath();
+        $oldRel  = ltrim(str_replace($base.'/', '', $oldPath), '/');
+        $newRel  = ltrim(str_replace($base.'/', '', $newPath), '/');
+        if ($this->currentPath === $oldRel || str_starts_with($this->currentPath, $oldRel.'/')) {
+            $this->currentPath = $newRel.substr($this->currentPath, strlen($oldRel));
+        }
+
+        $this->cancelRenameFolder();
+        $this->loadFiles();
+        $this->notify("Folder renamed to '{$newName}'.");
+    }
+
+    // ── Delete folder ─────────────────────────────────────────────────────────
+
+    public function confirmDeleteFolder(array $folder): void
+    {
+        $this->folderToDelete       = $folder;
+        $this->showFolderDeleteModal = true;
+    }
+
+    public function cancelDeleteFolder(): void
+    {
+        $this->folderToDelete       = null;
+        $this->showFolderDeleteModal = false;
+    }
+
+    public function deleteFolder(): void
+    {
+        $this->checkAccess();
+
+        if (! $this->folderToDelete) {
+            return;
+        }
+
+        $safePath   = $this->sanitizePath($this->folderToDelete['path']);
+        $folderName = $this->folderToDelete['name'];
+        $base       = $this->basePath();
+
+        if (! str_starts_with($safePath, $base.'/') || $safePath === $base) {
+            $this->cancelDeleteFolder();
+
+            return;
+        }
+
+        $this->disk()->deleteDirectory($safePath);
+
+        $relPath = ltrim(str_replace($base.'/', '', $safePath), '/');
+        if ($this->currentPath === $relPath || str_starts_with($this->currentPath, $relPath.'/')) {
+            $this->currentPath = $this->rootPath;
+        }
+
+        $this->folderToDelete       = null;
+        $this->showFolderDeleteModal = false;
+        $this->loadFiles();
+        $this->notify("Folder '{$folderName}' deleted.");
+    }
+
+    // ── Move ──────────────────────────────────────────────────────────────────
+
+    public function openMoveModal(?array $file = null): void
+    {
+        $this->filesToMove = $file ? [$file['path']] : $this->selectedFiles;
+
+        if (empty($this->filesToMove)) {
+            return;
+        }
+
+        $this->moveTargetFolder = null;
+        $this->loadAvailableFolders();
+        $this->showMoveModal = true;
+    }
+
+    public function closeMoveModal(): void
+    {
+        $this->showMoveModal    = false;
+        $this->filesToMove      = [];
+        $this->moveTargetFolder = null;
+    }
+
+    protected function loadAvailableFolders(): void
+    {
+        $base    = $this->basePath();
+        $allDirs = $this->disk()->allDirectories($base);
+
+        $this->availableFolders = collect($allDirs)
+            ->map(function (string $dir) use ($base) {
+                $relative = ltrim(str_replace($base, '', $dir), '/');
+                $depth    = $relative ? substr_count($relative, '/') + 1 : 0;
+
+                return [
+                    'path'         => $relative,
+                    'storage_path' => $dir,
+                    'name'         => basename($dir),
+                    'depth'        => $depth,
+                ];
+            })
+            ->prepend([
+                'path'         => '',
+                'storage_path' => $base,
+                'name'         => basename($base).' (root)',
+                'depth'        => 0,
+            ])
+            ->values()
+            ->toArray();
+    }
+
+    public function executeMove(): void
+    {
+        $this->checkAccess();
+
+        if (empty($this->filesToMove) || $this->moveTargetFolder === null) {
+            $this->closeMoveModal();
+
+            return;
+        }
+
+        $targetDir = $this->basePath(ltrim($this->sanitizePath($this->moveTargetFolder), '/'));
+        $targetDir = rtrim($targetDir, '/');
+
+        if (! $this->disk()->exists($targetDir)) {
+            $this->notify('Target folder does not exist.', 'error');
+
+            return;
+        }
+
+        $moved = 0;
+        foreach ($this->filesToMove as $filePath) {
+            $safePath = $this->resolveSecurePath($filePath);
+            if (! $safePath || ! $this->disk()->exists($safePath)) {
+                continue;
+            }
+
+            $filename = basename($safePath);
+            $newPath  = $targetDir.'/'.$filename;
+
+            if ($safePath === $newPath) {
+                continue;
+            }
+
+            if ($this->disk()->exists($newPath)) {
+                $ext      = pathinfo($filename, PATHINFO_EXTENSION);
+                $basename = pathinfo($filename, PATHINFO_FILENAME);
+                $newPath  = $targetDir.'/'.$basename.'_'.Str::random(4).($ext ? '.'.$ext : '');
+            }
+
+            $this->disk()->move($safePath, $newPath);
+
+            $oldThumb = $this->thumbnailStoragePath($filename);
+            if ($this->disk()->exists($oldThumb)) {
+                $this->disk()->move($oldThumb, $this->thumbnailStoragePath(basename($newPath)));
+            }
+
+            $moved++;
+        }
+
+        $this->selectedFiles = array_values(array_diff($this->selectedFiles, $this->filesToMove));
+        $this->closeMoveModal();
+        $this->loadFiles();
+
+        if ($moved > 0) {
+            $this->notify("{$moved} file(s) moved successfully.");
         }
     }
 
-    private function getFileType($filePath)
+    public function moveFile(string $filePath, string $targetFolderStoragePath): void
+    {
+        $this->checkAccess();
+
+        $safePath = $this->resolveSecurePath($filePath);
+        if (! $safePath) {
+            return;
+        }
+
+        $base      = $this->basePath();
+        $targetDir = $this->sanitizePath($targetFolderStoragePath);
+
+        if (! str_starts_with($targetDir, $base.'/') && $targetDir !== $base) {
+            $targetDir = $this->basePath($this->sanitizePath($targetFolderStoragePath));
+        }
+
+        $targetDir = rtrim($targetDir, '/');
+
+        if (! $this->disk()->exists($targetDir)) {
+            return;
+        }
+
+        $filename = basename($safePath);
+        $newPath  = $targetDir.'/'.$filename;
+
+        if ($safePath === $newPath) {
+            return;
+        }
+
+        if ($this->disk()->exists($newPath)) {
+            $ext      = pathinfo($filename, PATHINFO_EXTENSION);
+            $basename = pathinfo($filename, PATHINFO_FILENAME);
+            $newPath  = $targetDir.'/'.$basename.'_'.Str::random(4).($ext ? '.'.$ext : '');
+        }
+
+        $this->disk()->move($safePath, $newPath);
+
+        $oldThumb = $this->thumbnailStoragePath($filename);
+        if ($this->disk()->exists($oldThumb)) {
+            $this->disk()->move($oldThumb, $this->thumbnailStoragePath(basename($newPath)));
+        }
+
+        $this->selectedFiles = array_values(array_diff($this->selectedFiles, [$filePath]));
+        $this->loadFiles();
+        $this->notify("'{$filename}' moved.");
+    }
+
+    // ── File type helpers ─────────────────────────────────────────────────────
+
+    private function isFileTypeMatch(string $fileType, string $mediaType): bool
+    {
+        return match ($mediaType) {
+            'image' => $fileType === 'image',
+            'media' => in_array($fileType, ['video', 'audio']),
+            'file'  => in_array($fileType, ['pdf', 'word', 'excel', 'powerpoint', 'text', 'document']),
+            default => true,
+        };
+    }
+
+    private function getFileType(string $filePath): string
     {
         $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
 
-        $fileTypes = [
-            'jpg' => 'image', 'jpeg' => 'image', 'png' => 'image', 'gif' => 'image',
-            'webp' => 'image', 'bmp' => 'image',
-            'pdf' => 'pdf', 'doc' => 'word', 'docx' => 'word', 'txt' => 'text', 'rtf' => 'text',
-            'xls' => 'excel', 'xlsx' => 'excel', 'csv' => 'excel',
-            'ppt' => 'powerpoint', 'pptx' => 'powerpoint',
-            'mp4' => 'video', 'avi' => 'video', 'mov' => 'video', 'wmv' => 'video', 'flv' => 'video', 'mkv' => 'video', 'webm' => 'video',
-            'mp3' => 'audio', 'wav' => 'audio', 'ogg' => 'audio', 'flac' => 'audio', 'aac' => 'audio',
-        ];
-
-        return $fileTypes[$extension] ?? 'file';
+        return match ($extension) {
+            'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'             => 'image',
+            'pdf'                                                    => 'pdf',
+            'doc', 'docx'                                            => 'word',
+            'txt', 'rtf'                                             => 'text',
+            'xls', 'xlsx', 'csv'                                     => 'excel',
+            'ppt', 'pptx'                                            => 'powerpoint',
+            'mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm'       => 'video',
+            'mp3', 'wav', 'ogg', 'flac', 'aac'                      => 'audio',
+            default                                                  => 'file',
+        };
     }
 
-    public function getFileIcon($fileType)
-    {
-        switch ($fileType) {
-            case 'image':
-                return '<svg class="w-12 h-12 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm12 12H4l4-8 3 6 2-4 3 6z" clip-rule="evenodd"></path></svg>';
-            case 'pdf':
-                return '<svg class="w-12 h-12 text-red-600" fill="currentColor" viewBox="0 0 20 20"><path d="M4 18h12V6l-4-4H4v16zm8-14v3h3l-3-3zM6 8h2v1H6V8zm0 2h6v1H6v-1zm0 2h6v1H6v-1z"></path></svg>';
-            case 'word':
-                return '<svg class="w-12 h-12 text-blue-600" fill="currentColor" viewBox="0 0 20 20"><path d="M4 2h8l4 4v10a2 2 0 01-2 2H4a2 2 0 01-2-2V4a2 2 0 012-2zm8 4V4l2 2h-2zM6 8h6v1H6V8zm0 2h6v1H6v-1zm0 2h4v1H6v-1z"></path></svg>';
-            case 'excel':
-                return '<svg class="w-12 h-12 text-green-600" fill="currentColor" viewBox="0 0 20 20"><path d="M3 3h14a1 1 0 011 1v12a1 1 0 01-1 1H3a1 1 0 01-1-1V4a1 1 0 011-1zm1 2v10h12V5H4zm2 2h8v1H6V7zm0 2h8v1H6V9zm0 2h8v1H6v-1zm0 2h5v1H6v-1z"></path></svg>';
-            case 'powerpoint':
-                return '<svg class="w-12 h-12 text-orange-500" fill="currentColor" viewBox="0 0 20 20"><path d="M4 2h8l4 4v10a2 2 0 01-2 2H4a2 2 0 01-2-2V4a2 2 0 012-2zm8 4V4l2 2h-2zM6 8h6v4H6V8zm1 1v2h4V9H7z"></path></svg>';
-            case 'text':
-                return '<svg class="w-12 h-12 text-gray-600" fill="currentColor" viewBox="0 0 20 20"><path d="M4 2h8l4 4v10a2 2 0 01-2 2H4a2 2 0 01-2-2V4a2 2 0 012-2zm8 4V4l2 2h-2zM6 8h6v1H6V8zm0 2h6v1H6v-1zm0 2h6v1H6v-1zm0 2h4v1H6v-1z"></path></svg>';
-            case 'video':
-                return '<svg class="w-12 h-12 text-purple-500" fill="currentColor" viewBox="0 0 20 20"><path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z"></path></svg>';
-            case 'audio':
-                return '<svg class="w-12 h-12 text-pink-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217z" clip-rule="evenodd"></path></svg>';
-            default:
-                return '<svg class="w-12 h-12 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd"></path></svg>';
-        }
-    }
+    // ── Thumbnail helpers ─────────────────────────────────────────────────────
 
-    private function getThumbnailUrl($filePath, ?int $modified = null)
+    private function getThumbnailUrl(string $filePath, ?int $modified = null): ?string
     {
-        if ($this->getFileType($filePath) === 'image') {
-            $ts = $modified ?? Storage::disk('public')->lastModified($filePath);
-
-            return Storage::disk('public')->url($filePath).'?t='.$ts;
+        if ($this->getFileType($filePath) !== 'image') {
+            return null;
         }
 
-        return null;
+        $ts        = $modified ?? $this->disk()->lastModified($filePath);
+        $thumbPath = $this->thumbnailStoragePath(basename($filePath));
+
+        if ($this->disk()->exists($thumbPath)) {
+            return $this->disk()->url($thumbPath).'?t='.$ts;
+        }
+
+        return $this->disk()->url($filePath).'?t='.$ts;
     }
 
-    private function sanitizePath(string $path): string
-    {
-        // Normalise separators and strip every directory-traversal segment
-        $path = str_replace('\\', '/', $path);
-        $parts = array_filter(
-            explode('/', $path),
-            fn ($p) => $p !== '' && $p !== '.' && $p !== '..'
-        );
-
-        return implode('/', $parts);
-    }
-
-    private function isImageFile($file)
-    {
-        return in_array(strtolower($file->getClientOriginalExtension()),
-            ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']);
-    }
-
-    private function createThumbnail($filePath)
+    private function createThumbnail(string $filePath): void
     {
         try {
-            $fullPath = Storage::disk('public')->path($filePath);
-            $thumbnailDir = Storage::disk('public')->path('uploads/thumbnails');
+            $fullPath      = $this->disk()->path($filePath);
+            $thumbPath     = $this->thumbnailStoragePath(basename($filePath));
+            $thumbFullPath = $this->disk()->path($thumbPath);
+            $thumbDir      = dirname($thumbFullPath);
 
-            if (! is_dir($thumbnailDir)) {
-                mkdir($thumbnailDir, 0755, true);
+            if (! is_dir($thumbDir)) {
+                mkdir($thumbDir, 0755, true);
             }
 
-            $thumbnailPath = $thumbnailDir.'/'.basename($filePath);
+            $w = config('file-manager.thumbnail.width', 150);
+            $h = config('file-manager.thumbnail.height', 150);
 
             $manager = new ImageManager(new Driver);
-            $image = $manager->read($fullPath);
-            $image->cover(150, 150);
-            $image->save($thumbnailPath);
+            $image   = $manager->read($fullPath);
+            $image->cover($w, $h);
+            $image->save($thumbFullPath);
 
         } catch (\Exception $e) {
             logger()->error('Thumbnail creation failed: '.$e->getMessage());
         }
     }
 
-    // ── AI Image Generation ─────────────────────────────────────────────────────
+    private function isImageFile($file): bool
+    {
+        return in_array(
+            strtolower($file->getClientOriginalExtension()),
+            ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
+        );
+    }
+
+    // ── AI image generation ───────────────────────────────────────────────────
 
     public function toggleAiGenerator(): void
     {
         $this->showAiGenerator = ! $this->showAiGenerator;
-        $this->aiError = '';
+        $this->aiError         = '';
         if ($this->showAiGenerator) {
             $this->fetchAiQuota();
         }
@@ -753,15 +1206,14 @@ class FileManager extends Component
 
         try {
             if ($this->aiProvider === 'cloudflare') {
-                // Cloudflare does not expose a quota API — show free tier info
                 $this->aiQuota = [
-                    'label' => 'Free tier: 32 - 300 images per day depending on size',
-                    'pct' => null,
+                    'label' => 'Free tier: 32–300 images/day depending on size',
+                    'pct'   => null,
                 ];
             } elseif ($this->aiProvider === 'picsart') {
                 $this->aiQuota = [
                     'label' => 'Picsart Gen AI — free tier: 100 credits/day',
-                    'pct' => null,
+                    'pct'   => null,
                 ];
             } elseif ($this->aiProvider === 'huggingface') {
                 $token = config('services.huggingface.key');
@@ -774,26 +1226,28 @@ class FileManager extends Component
                     ->get('https://huggingface.co/api/whoami-v2');
 
                 if ($response->ok()) {
-                    $plan = $response->json('plan') ?? 'free';
+                    $plan          = $response->json('plan') ?? 'free';
                     $this->aiQuota = [
                         'label' => 'Plan: '.ucfirst($plan).' — rate limited',
-                        'pct' => null,
+                        'pct'   => null,
                     ];
                 }
             }
         } catch (\Exception) {
-            // Quota fetch is non-critical — silently ignore errors
+            // Non-critical — silently ignore
         }
     }
 
     public function generateAiImage(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         $this->validate(['aiPrompt' => 'required|string|min:3|max:500']);
 
         $rateLimitKey = 'ai-generate:'.auth()->id();
-        if (RateLimiter::tooManyAttempts($rateLimitKey, 10)) {
+        $limit        = config('file-manager.rate_limits.ai_generate', 10);
+
+        if (RateLimiter::tooManyAttempts($rateLimitKey, $limit)) {
             $this->aiError = 'Too many requests. Please wait before generating more images.';
 
             return;
@@ -801,24 +1255,16 @@ class FileManager extends Component
         RateLimiter::hit($rateLimitKey, 60);
 
         $this->aiGenerating = true;
-        $this->aiError = '';
+        $this->aiError      = '';
 
         try {
-            $service = match ($this->aiProvider) {
-                'huggingface' => app(HuggingFaceImageService::class),
-                'picsart' => app(PicsartImageService::class),
-                default => app(CloudflareImageService::class),
-            };
-            [$width, $height] = array_map('intval', explode('x', $this->aiImageSize));
-            $file = $service->generate($this->aiPrompt, 'images', $width, $height);
+            $file = $this->runAiGeneration($this->aiProvider, $this->aiPrompt, $this->aiImageSize);
 
-            $this->createThumbnail($file['path']);
-            $this->loadFiles();
-            $this->lastAiPrompt = $this->aiPrompt;
-            $this->lastAiProvider = $this->aiProvider;
-            $this->lastAiImageSize = $this->aiImageSize;
-            $this->aiPrompt = '';
-            $this->showAiGenerator = false;
+            $this->lastAiPrompt     = $this->aiPrompt;
+            $this->lastAiProvider   = $this->aiProvider;
+            $this->lastAiImageSize  = $this->aiImageSize;
+            $this->aiPrompt         = '';
+            $this->showAiGenerator  = false;
             $this->previewImage($file);
             $this->isAiGeneratedPreview = true;
         } catch (\RuntimeException $e) {
@@ -830,14 +1276,16 @@ class FileManager extends Component
 
     public function regenerateAiImage(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if (! $this->lastAiPrompt || ! $this->previewFile || ! $this->isAiGeneratedPreview) {
             return;
         }
 
         $rateLimitKey = 'ai-generate:'.auth()->id();
-        if (RateLimiter::tooManyAttempts($rateLimitKey, 10)) {
+        $limit        = config('file-manager.rate_limits.ai_generate', 10);
+
+        if (RateLimiter::tooManyAttempts($rateLimitKey, $limit)) {
             $this->aiError = 'Too many requests. Please wait before generating more images.';
 
             return;
@@ -845,35 +1293,26 @@ class FileManager extends Component
         RateLimiter::hit($rateLimitKey, 60);
 
         $this->aiGenerating = true;
-        $this->aiError = '';
+        $this->aiError      = '';
 
-        // Delete the existing preview file and its thumbnail so they don't accumulate
+        // Delete the existing preview file so they don't accumulate
         $oldPath = $this->sanitizePath($this->previewFile['path']);
-        if (str_starts_with($oldPath, 'uploads/') && Storage::disk('public')->exists($oldPath)) {
-            Storage::disk('public')->delete($oldPath);
-            $thumbPath = 'uploads/thumbnails/'.basename($oldPath);
-            if (Storage::disk('public')->exists($thumbPath)) {
-                Storage::disk('public')->delete($thumbPath);
+        if (str_starts_with($oldPath, $this->basePath().'/') && $this->disk()->exists($oldPath)) {
+            $this->disk()->delete($oldPath);
+            $thumbPath = $this->thumbnailStoragePath(basename($oldPath));
+            if ($this->disk()->exists($thumbPath)) {
+                $this->disk()->delete($thumbPath);
             }
         }
 
         try {
-            $service = match ($this->lastAiProvider) {
-                'huggingface' => app(HuggingFaceImageService::class),
-                'picsart' => app(PicsartImageService::class),
-                default => app(CloudflareImageService::class),
-            };
-            [$width, $height] = array_map('intval', explode('x', $this->lastAiImageSize));
-            $file = $service->generate($this->lastAiPrompt, 'images', $width, $height);
+            $file = $this->runAiGeneration($this->lastAiProvider, $this->lastAiPrompt, $this->lastAiImageSize);
 
-            $this->createThumbnail($file['path']);
-            $this->loadFiles();
             $this->previewImage($file);
             $this->isAiGeneratedPreview = true;
-            session()->flash('message', 'Image regenerated.');
+            $this->notify('Image regenerated.');
         } catch (\RuntimeException $e) {
-            $this->aiError = $e->getMessage();
-            // Reload files since we deleted the old one
+            $this->aiError   = $e->getMessage();
             $this->previewFile = null;
             $this->loadFiles();
         } finally {
@@ -881,21 +1320,47 @@ class FileManager extends Component
         }
     }
 
-    // ── Image editor ────────────────────────────────────────────────────────────
+    private function runAiGeneration(string $provider, string $prompt, string $imageSize): array
+    {
+        [$width, $height] = array_map('intval', explode('x', $imageSize));
+
+        $service = match ($provider) {
+            'huggingface' => app(HuggingFaceImageService::class),
+            'picsart'     => app(PicsartImageService::class),
+            default       => app(CloudflareImageService::class),
+        };
+
+        $targetFolder = ltrim($this->currentPath, '/') ?: 'images';
+        $file         = $service->generate($prompt, $targetFolder, $width, $height);
+
+        $this->createThumbnail($file['path']);
+
+        // Add thumbnail URL so the delete modal and preview panel can use it
+        $thumbPath        = $this->thumbnailStoragePath(basename($file['path']));
+        $file['thumbnail'] = $this->disk()->exists($thumbPath)
+            ? $this->disk()->url($thumbPath).'?t='.time()
+            : $file['url'];
+
+        $this->loadFiles();
+
+        return $file;
+    }
+
+    // ── Image editor ──────────────────────────────────────────────────────────
 
     public function previewImage(array $file): void
     {
-        $this->previewFile = $file;
+        $this->previewFile        = $file;
         $this->isAiGeneratedPreview = false;
         $this->resetEdits();
 
         try {
-            $fullPath = Storage::disk('public')->path($file['path']);
-            $info = @getimagesize($fullPath);
+            $fullPath = $this->disk()->path($file['path']);
+            $info     = @getimagesize($fullPath);
             if ($info) {
                 $this->originalDimensions = ['width' => $info[0], 'height' => $info[1]];
-                $this->editResizeWidth = $info[0];
-                $this->editResizeHeight = $info[1];
+                $this->editResizeWidth    = $info[0];
+                $this->editResizeHeight   = $info[1];
             }
         } catch (\Exception) {
             $this->originalDimensions = [];
@@ -910,7 +1375,7 @@ class FileManager extends Component
 
     public function deletePreviewFile(): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if (! $this->previewFile) {
             return;
@@ -921,14 +1386,18 @@ class FileManager extends Component
             return;
         }
 
-        Storage::disk('public')->delete($safePath);
+        $this->disk()->delete($safePath);
+        $thumbPath = $this->thumbnailStoragePath(basename($safePath));
+        if ($this->disk()->exists($thumbPath)) {
+            $this->disk()->delete($thumbPath);
+        }
 
-        $this->previewFile = null;
-        $this->resetEdits();
-        $this->showDeleteModal = false;
+        $this->previewFile         = null;
+        $this->showDeleteModal     = false;
         $this->deletingPreviewFile = false;
+        $this->resetEdits();
         $this->loadFiles();
-        session()->flash('message', 'Image deleted.');
+        $this->notify('Image deleted.');
     }
 
     public function insertPreviewFile(): void
@@ -939,80 +1408,56 @@ class FileManager extends Component
         }
     }
 
-    /**
-     * Crop the current image to the given pixel region and overwrite in place.
-     */
     public function applyCrop(int $x, int $y, int $width, int $height): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if (! $this->previewFile) {
             return;
         }
 
-        $width = max(1, min(10000, $width));
+        $width  = max(1, min(10000, $width));
         $height = max(1, min(10000, $height));
-        $x = max(0, $x);
-        $y = max(0, $y);
+        $x      = max(0, $x);
+        $y      = max(0, $y);
 
         $storagePath = $this->resolveSecurePath($this->previewFile['path']);
         if (! $storagePath) {
             return;
         }
 
-        $fullPath = Storage::disk('public')->path($storagePath);
+        $fullPath = $this->disk()->path($storagePath);
 
         if (! file_exists($fullPath)) {
-            session()->flash('error', 'Source file not found.');
+            $this->notify('Source file not found.', 'error');
 
             return;
         }
 
         try {
             $manager = new ImageManager(new Driver);
-            $image = $manager->read($fullPath);
+            $image   = $manager->read($fullPath);
 
             $imgW = $image->width();
             $imgH = $image->height();
 
-            // Clamp to actual image bounds
-            $x = min($x, max(0, $imgW - 1));
-            $y = min($y, max(0, $imgH - 1));
-            $width = min($width, $imgW - $x);
+            $x      = min($x, max(0, $imgW - 1));
+            $y      = min($y, max(0, $imgH - 1));
+            $width  = min($width, $imgW - $x);
             $height = min($height, $imgH - $y);
 
             $image->crop($width, $height, $x, $y);
             $image->save($fullPath, 90);
 
-            $this->createThumbnail($storagePath);
-
-            $savedAt = time();
-            $this->previewFile = array_merge($this->previewFile, [
-                'url' => Storage::disk('public')->url($storagePath).'?t='.$savedAt,
-                'size' => filesize($fullPath),
-                'modified' => $savedAt,
-                'thumbnail' => Storage::disk('public')->url($storagePath).'?t='.$savedAt,
-            ]);
-
-            $info = @getimagesize($fullPath);
-            $this->originalDimensions = $info ? ['width' => $info[0], 'height' => $info[1]] : [];
-            $this->editResizeWidth = $info[0] ?? null;
-            $this->editResizeHeight = $info[1] ?? null;
-
-            $this->editVersion++;
-            $this->isAiGeneratedPreview = false; // edited image is no longer a raw AI preview
-            $this->loadFiles();
-            session()->flash('message', 'Image cropped.');
+            $this->refreshPreviewAfterSave($storagePath, $fullPath);
+            $this->notify('Image cropped.');
 
         } catch (\Exception $e) {
             logger()->error('Image crop failed', ['error' => $e->getMessage()]);
-            session()->flash('error', 'Crop failed: '.$e->getMessage());
+            $this->notify('Crop failed: '.$e->getMessage(), 'error');
         }
     }
 
-    /**
-     * Save any pending edits then insert (dispatch fileSelected).
-     */
     public function saveAndInsert(int $rotate = 0, bool $flipH = false, bool $flipV = false, int $brightness = 0, int $contrast = 0, int $quality = 85, bool $greyscale = false, int $blur = 0, int $sharpen = 0): void
     {
         $hasEdits = $rotate !== 0 || $flipH || $flipV || $brightness !== 0 || $contrast !== 0 || $greyscale || $blur > 0 || $sharpen > 0;
@@ -1027,12 +1472,9 @@ class FileManager extends Component
         $this->insertPreviewFile();
     }
 
-    /**
-     * Apply edits and overwrite the current file in place.
-     */
     public function saveOverwrite(int $rotate = 0, bool $flipH = false, bool $flipV = false, int $brightness = 0, int $contrast = 0, int $quality = 85, bool $greyscale = false, int $blur = 0, int $sharpen = 0): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if (! $this->previewFile) {
             return;
@@ -1043,10 +1485,10 @@ class FileManager extends Component
             return;
         }
 
-        $fullPath = Storage::disk('public')->path($storagePath);
+        $fullPath = $this->disk()->path($storagePath);
 
         if (! file_exists($fullPath)) {
-            session()->flash('error', 'Source file not found.');
+            $this->notify('Source file not found.', 'error');
 
             return;
         }
@@ -1056,20 +1498,17 @@ class FileManager extends Component
             $image->save($fullPath, max(10, min(100, $quality)));
 
             $this->refreshPreviewAfterSave($storagePath, $fullPath);
-            session()->flash('message', 'Image saved.');
+            $this->notify('Image saved.');
 
         } catch (\Exception $e) {
             logger()->error('Image overwrite failed', ['error' => $e->getMessage()]);
-            session()->flash('error', 'Save failed: '.$e->getMessage());
+            $this->notify('Save failed: '.$e->getMessage(), 'error');
         }
     }
 
-    /**
-     * Apply edits and save as a new file.
-     */
     public function saveEditedCopy(int $rotate = 0, bool $flipH = false, bool $flipV = false, int $brightness = 0, int $contrast = 0, int $quality = 85, bool $greyscale = false, int $blur = 0, int $sharpen = 0): void
     {
-        abort_unless(auth()->check(), 403);
+        $this->checkAccess();
 
         if (! $this->previewFile) {
             return;
@@ -1080,10 +1519,10 @@ class FileManager extends Component
             return;
         }
 
-        $sourcePath = Storage::disk('public')->path($storagePath);
+        $sourcePath = $this->disk()->path($storagePath);
 
         if (! file_exists($sourcePath)) {
-            session()->flash('error', 'Source file not found.');
+            $this->notify('Source file not found.', 'error');
 
             return;
         }
@@ -1091,50 +1530,43 @@ class FileManager extends Component
         try {
             $image = $this->applyImageEdits($sourcePath, $rotate, $flipH, $flipV, $brightness, $contrast, $quality, $greyscale, $blur, $sharpen);
 
-            // Build output path
-            $ext = strtolower(pathinfo($storagePath, PATHINFO_EXTENSION));
-            $base = preg_replace('/_edited_[a-z0-9]+$/', '', pathinfo($storagePath, PATHINFO_FILENAME));
+            $ext     = strtolower(pathinfo($storagePath, PATHINFO_EXTENSION));
+            $base    = preg_replace('/_edited_[a-z0-9]+$/', '', pathinfo($storagePath, PATHINFO_FILENAME));
             $newName = $base.'_edited_'.Str::random(8).'.'.$ext;
             $newPath = dirname($storagePath).'/'.$newName;
-            $fullNew = Storage::disk('public')->path($newPath);
+            $fullNew = $this->disk()->path($newPath);
 
             $image->save($fullNew, max(10, min(100, $quality)));
 
             $this->refreshPreviewAfterSave($newPath, $fullNew, $newName);
-            session()->flash('message', 'Image saved as copy.');
+            $this->notify('Image saved as copy.');
 
         } catch (\Exception $e) {
             logger()->error('Image edit save failed', ['error' => $e->getMessage()]);
-            session()->flash('error', 'Save failed: '.$e->getMessage());
+            $this->notify('Save failed: '.$e->getMessage(), 'error');
         }
     }
 
-    /**
-     * Apply all image edits (resize, rotate, flip, adjustments) and return the image instance.
-     */
     private function applyImageEdits(string $fullPath, int $rotate, bool $flipH, bool $flipV, int $brightness, int $contrast, int $quality, bool $greyscale, int $blur, int $sharpen): \Intervention\Image\Interfaces\ImageInterface
     {
         $manager = new ImageManager(new Driver);
-        $image = $manager->read($fullPath);
+        $image   = $manager->read($fullPath);
 
-        // Resize
         $origW = $image->width();
         $origH = $image->height();
-        $w = max(1, min(10000, (int) ($this->editResizeWidth ?: $origW)));
-        $h = max(1, min(10000, (int) ($this->editResizeHeight ?: $origH)));
+        $w     = max(1, min(10000, (int) ($this->editResizeWidth ?: $origW)));
+        $h     = max(1, min(10000, (int) ($this->editResizeHeight ?: $origH)));
         if ($w !== $origW || $h !== $origH) {
             $this->editKeepAspect
                 ? $image->scale(width: $w)
                 : $image->resize($w, $h);
         }
 
-        // Rotate (Intervention v3: positive = counter-clockwise; we store clockwise)
         $rotate = $rotate % 360;
         if ($rotate) {
             $image->rotate(-$rotate);
         }
 
-        // Flip
         if ($flipH) {
             $image->flip();
         }
@@ -1142,11 +1574,10 @@ class FileManager extends Component
             $image->flop();
         }
 
-        // Adjustments (clamped to safe ranges)
         $brightness = max(-100, min(100, $brightness));
-        $contrast = max(-100, min(100, $contrast));
-        $blur = max(0, min(100, $blur));
-        $sharpen = max(0, min(100, $sharpen));
+        $contrast   = max(-100, min(100, $contrast));
+        $blur       = max(0, min(100, $blur));
+        $sharpen    = max(0, min(100, $sharpen));
 
         if ($brightness !== 0) {
             $image->brightness($brightness);
@@ -1167,15 +1598,13 @@ class FileManager extends Component
         return $image;
     }
 
-    /**
-     * Sanitize and validate a storage path, returning null (with flash) on failure.
-     */
     private function resolveSecurePath(string $path): ?string
     {
-        $safe = $this->sanitizePath($path);
+        $safe   = $this->sanitizePath($path);
+        $prefix = $this->basePath().'/';
 
-        if (! str_starts_with($safe, 'uploads/')) {
-            session()->flash('error', 'Invalid file path.');
+        if (! str_starts_with($safe, $prefix)) {
+            $this->notify('Invalid file path.', 'error');
 
             return null;
         }
@@ -1183,39 +1612,38 @@ class FileManager extends Component
         return $safe;
     }
 
-    /**
-     * After saving an image, regenerate thumbnail, reload dimensions, and refresh preview state.
-     */
     private function refreshPreviewAfterSave(string $storagePath, string $fullPath, ?string $newName = null): void
     {
         $this->createThumbnail($storagePath);
 
         $info = @getimagesize($fullPath);
         $this->originalDimensions = $info ? ['width' => $info[0], 'height' => $info[1]] : [];
-        $this->editResizeWidth = $info[0] ?? null;
-        $this->editResizeHeight = $info[1] ?? null;
+        $this->editResizeWidth    = $info[0] ?? null;
+        $this->editResizeHeight   = $info[1] ?? null;
 
-        $savedAt = time();
-        $urlWithCacheBust = Storage::disk('public')->url($storagePath).'?t='.$savedAt;
+        $savedAt        = time();
+        $urlWithBust    = $this->disk()->url($storagePath).'?t='.$savedAt;
+        $thumbPath      = $this->thumbnailStoragePath(basename($storagePath));
+        $thumbUrl       = $this->disk()->exists($thumbPath)
+            ? $this->disk()->url($thumbPath).'?t='.$savedAt
+            : $urlWithBust;
 
         if ($newName) {
-            // Save-as-copy: replace the entire preview file entry
             $this->previewFile = [
-                'name' => $newName,
-                'path' => $storagePath,
-                'url' => $urlWithCacheBust,
-                'size' => filesize($fullPath),
-                'type' => 'image',
-                'modified' => $savedAt,
-                'thumbnail' => $urlWithCacheBust,
+                'name'      => $newName,
+                'path'      => $storagePath,
+                'url'       => $urlWithBust,
+                'size'      => filesize($fullPath),
+                'type'      => 'image',
+                'modified'  => $savedAt,
+                'thumbnail' => $thumbUrl,
             ];
         } else {
-            // Overwrite: merge into existing preview
             $this->previewFile = array_merge($this->previewFile, [
-                'url' => $urlWithCacheBust,
-                'size' => filesize($fullPath),
-                'modified' => $savedAt,
-                'thumbnail' => $urlWithCacheBust,
+                'url'       => $urlWithBust,
+                'size'      => filesize($fullPath),
+                'modified'  => $savedAt,
+                'thumbnail' => $thumbUrl,
             ]);
         }
 
@@ -1226,14 +1654,23 @@ class FileManager extends Component
 
     protected function resetEdits(): void
     {
-        $this->editResizeWidth = null;
+        $this->editResizeWidth  = null;
         $this->editResizeHeight = null;
-        $this->editKeepAspect = true;
-        $this->editVersion = 0;
+        $this->editKeepAspect   = true;
+        $this->editVersion      = 0;
         $this->originalDimensions = [];
     }
 
-    // ────────────────────────────────────────────────────────────────────────────
+    private function sanitizePath(string $path): string
+    {
+        $path  = str_replace('\\', '/', $path);
+        $parts = array_filter(
+            explode('/', $path),
+            fn ($p) => $p !== '' && $p !== '.' && $p !== '..'
+        );
+
+        return implode('/', $parts);
+    }
 
     public function render()
     {

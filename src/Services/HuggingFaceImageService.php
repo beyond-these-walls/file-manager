@@ -57,14 +57,16 @@ class HuggingFaceImageService
         $extension = 'jpg';
 
         $filename    = 'ai_' . now()->format('YmdHis') . '_' . Str::random(6) . '.' . $extension;
-        $storagePath = 'uploads/' . trim($folder, '/') . '/' . $filename;
+        $base        = rtrim(config('file-manager.base_path', 'uploads'), '/');
+        $diskName    = config('file-manager.disk', 'public');
+        $storagePath = $base . '/' . trim($folder, '/') . '/' . $filename;
 
-        Storage::disk('public')->put($storagePath, $imageData);
+        Storage::disk($diskName)->put($storagePath, $imageData);
 
         return [
             'name'     => $filename,
             'path'     => $storagePath,
-            'url'      => Storage::disk('public')->url($storagePath),
+            'url'      => Storage::disk($diskName)->url($storagePath),
             'size'     => strlen($imageData),
             'type'     => 'image',
             'modified' => time(),
