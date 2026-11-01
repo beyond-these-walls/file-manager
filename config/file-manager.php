@@ -74,8 +74,6 @@ return [
     */
     'ai_providers' => [
         'cloudflare'  => 'Cloudflare Workers AI (FLUX)',
-        'huggingface' => 'Hugging Face FLUX',
-        'picsart'     => 'Picsart Gen AI',
     ],
 
     /*

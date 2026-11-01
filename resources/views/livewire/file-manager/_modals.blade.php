@@ -2,7 +2,7 @@
 
 {{-- Delete single file --}}
 @php $deleteTarget = $fileToDelete ?? $previewFile ?? null; @endphp
-<x-confirm-modal
+<x-file-manager::confirm-modal
     :show="$showDeleteModal && ($fileToDelete || $deletingPreviewFile)"
     title="Confirm Delete"
     confirmAction="deleteFile"
@@ -33,10 +33,10 @@
         </div>
     </div>
     @endif
-</x-confirm-modal>
+</x-file-manager::confirm-modal>
 
 {{-- Bulk delete --}}
-<x-confirm-modal
+<x-file-manager::confirm-modal
     :show="$showBulkDeleteModal"
     title="Confirm Bulk Delete"
     confirmAction="bulkDelete"
@@ -55,10 +55,10 @@
         <div class="truncate">{{ basename($path) }}</div>
         @endforeach
     </div>
-</x-confirm-modal>
+</x-file-manager::confirm-modal>
 
 {{-- Delete folder --}}
-<x-confirm-modal
+<x-file-manager::confirm-modal
     :show="$showFolderDeleteModal"
     title="Delete Folder"
     confirmAction="deleteFolder"
@@ -80,7 +80,7 @@
         <span class="text-sm font-medium text-gray-900 dark:text-neutral-100">{{ $folderToDelete['name'] }}/</span>
     </div>
     @endif
-</x-confirm-modal>
+</x-file-manager::confirm-modal>
 
 {{-- Move modal --}}
 @if($showMoveModal)
