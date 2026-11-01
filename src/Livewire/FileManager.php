@@ -13,6 +13,7 @@ use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Intervention\Image\Drivers\Gd\Driver;
 use Intervention\Image\ImageManager;
+use Intervention\Image\Interfaces\ImageInterface;
 use League\Flysystem\DirectoryAttributes;
 use League\Flysystem\FileAttributes;
 use Livewire\Attributes\On;
@@ -1165,8 +1166,7 @@ class FileManager extends Component
             $w = config('file-manager.thumbnail.width', 150);
             $h = config('file-manager.thumbnail.height', 150);
 
-            $manager = new ImageManager(new Driver);
-            $image   = $manager->read($fullPath);
+            $image   = $this->readImage($fullPath);
             $image->cover($w, $h);
             $image->save($thumbFullPath);
 
@@ -1435,8 +1435,7 @@ class FileManager extends Component
         }
 
         try {
-            $manager = new ImageManager(new Driver);
-            $image   = $manager->read($fullPath);
+            $image   = $this->readImage($fullPath);
 
             $imgW = $image->width();
             $imgH = $image->height();
@@ -1447,7 +1446,7 @@ class FileManager extends Component
             $height = min($height, $imgH - $y);
 
             $image->crop($width, $height, $x, $y);
-            $image->save($fullPath, 90);
+            $image->save($fullPath, quality: 90);
 
             $this->refreshPreviewAfterSave($storagePath, $fullPath);
             $this->notify('Image cropped.');
@@ -1495,7 +1494,7 @@ class FileManager extends Component
 
         try {
             $image = $this->applyImageEdits($fullPath, $rotate, $flipH, $flipV, $brightness, $contrast, $quality, $greyscale, $blur, $sharpen);
-            $image->save($fullPath, max(10, min(100, $quality)));
+            $image->save($fullPath, quality: max(10, min(100, $quality)));
 
             $this->refreshPreviewAfterSave($storagePath, $fullPath);
             $this->notify('Image saved.');
@@ -1536,7 +1535,7 @@ class FileManager extends Component
             $newPath = dirname($storagePath).'/'.$newName;
             $fullNew = $this->disk()->path($newPath);
 
-            $image->save($fullNew, max(10, min(100, $quality)));
+            $image->save($fullNew, quality: max(10, min(100, $quality)));
 
             $this->refreshPreviewAfterSave($newPath, $fullNew, $newName);
             $this->notify('Image saved as copy.');
@@ -1547,10 +1546,9 @@ class FileManager extends Component
         }
     }
 
-    private function applyImageEdits(string $fullPath, int $rotate, bool $flipH, bool $flipV, int $brightness, int $contrast, int $quality, bool $greyscale, int $blur, int $sharpen): \Intervention\Image\Interfaces\ImageInterface
+    private function applyImageEdits(string $fullPath, int $rotate, bool $flipH, bool $flipV, int $brightness, int $contrast, int $quality, bool $greyscale, int $blur, int $sharpen): ImageInterface
     {
-        $manager = new ImageManager(new Driver);
-        $image   = $manager->read($fullPath);
+        $image   = $this->readImage($fullPath);
 
         $origW = $image->width();
         $origH = $image->height();
@@ -1564,14 +1562,14 @@ class FileManager extends Component
 
         $rotate = $rotate % 360;
         if ($rotate) {
-            $image->rotate(-$rotate);
+            $image->rotate($this->usesInterventionV4() ? $rotate : -$rotate);
         }
 
         if ($flipH) {
-            $image->flip();
+            $this->flipImage($image, horizontal: true);
         }
         if ($flipV) {
-            $image->flop();
+            $this->flipImage($image, horizontal: false);
         }
 
         $brightness = max(-100, min(100, $brightness));
@@ -1586,7 +1584,11 @@ class FileManager extends Component
             $image->contrast($contrast);
         }
         if ($greyscale) {
-            $image->greyscale();
+            if ($this->usesInterventionV4()) {
+                $image->grayscale();
+            } else {
+                $image->greyscale();
+            }
         }
         if ($blur > 0) {
             $image->blur($blur);
@@ -1596,6 +1598,35 @@ class FileManager extends Component
         }
 
         return $image;
+    }
+
+    /**
+     * Intervention Image v4 renamed read() to decodePath(), rotates clockwise,
+     * and replaced flip()/flop() with flip(Direction).
+     */
+    private function usesInterventionV4(): bool
+    {
+        return method_exists(ImageManager::class, 'decodePath');
+    }
+
+    private function readImage(string $fullPath): ImageInterface
+    {
+        $manager = new ImageManager(new Driver);
+
+        return $this->usesInterventionV4()
+            ? $manager->decodePath($fullPath)
+            : $manager->read($fullPath);
+    }
+
+    private function flipImage(ImageInterface $image, bool $horizontal): void
+    {
+        if ($this->usesInterventionV4()) {
+            $image->flip($horizontal ? \Intervention\Image\Direction::HORIZONTAL : \Intervention\Image\Direction::VERTICAL);
+
+            return;
+        }
+
+        $horizontal ? $image->flop() : $image->flip();
     }
 
     private function resolveSecurePath(string $path): ?string
