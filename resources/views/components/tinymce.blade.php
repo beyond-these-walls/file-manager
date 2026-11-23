@@ -18,6 +18,14 @@
 @endphp
 
 <div>
+    @once
+        <style>
+            .tox .tox-tbtn { height: 28px; width: 28px; margin: 2px 0; }
+            .tox .tox-tbtn svg { transform: scale(.8); }
+            .tox .tox-toolbar__group { padding: 0 4px; }
+        </style>
+    @endonce
+
     {{-- File manager rendered once per page even with multiple editors --}}
     @if($fileManager)
         @once
