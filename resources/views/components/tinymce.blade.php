@@ -9,6 +9,8 @@
     'statusbar' => false,
     'relativeUrls' => true,
     'readonly' => false,
+    'contentCss' => null,
+    'bodyClass' => null,
 ])
 
 @php
@@ -62,10 +64,18 @@
         statusbar: {{ $statusbar ? 'true' : 'false' }},
         resize: true,
         skin: localStorage.getItem('theme') === 'dark' ? 'oxide-dark' : 'oxide',
+        @if($contentCss)
+        content_css: {!! Js::from($contentCss) !!},
+        content_style: 'body { margin: 1rem; background-color: #ffffff; }',
+        @if($bodyClass)
+        body_class: {!! Js::from($bodyClass) !!},
+        @endif
+        @else
         content_css: localStorage.getItem('theme') === 'dark' ? 'dark' : 'default',
         content_style: localStorage.getItem('theme') === 'dark'
             ? 'body { font-family: Helvetica, Arial, sans-serif; font-size: 16px; background-color: #333333; color: #e5e5e5; }'
             : 'body { font-family: Helvetica, Arial, sans-serif; font-size: 16px; }',
+        @endif
         convert_urls: {{ $relativeUrls ? 'true' : 'false' }},
         relative_urls: {{ $relativeUrls ? 'true' : 'false' }},
         remove_script_host: {{ $relativeUrls ? 'true' : 'false' }},
